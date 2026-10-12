@@ -1,4 +1,12 @@
 node_modules/
+dist/
+
+# Files
+alb.tf.backup
+ec2.tf.backup
+vpc.tf.backup
+tfplan
+scripts
 
 # Terraform
 .terraform/
@@ -7,9 +15,11 @@ node_modules/
 crash.log
 crash.*.log
 *.tfvars
+*lock.hcl
 
 # AWS
 .aws/
+aws
 
 # Environment variables
 .env
