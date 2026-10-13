@@ -1,3 +1,4 @@
+
 name: CI - Build and Scan Application
 
 on:
@@ -28,8 +29,8 @@ jobs:
         with:
           context: ./app
           push: false
-          tags: production-devops-app:${{ github.sha }}
           load: true
+          tags: production-devops-app:${{ github.sha }}
           build-args: |
             RELEASE_SHA=${{ github.sha }}
 
@@ -44,8 +45,23 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
 
+      - name: Save scanned image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker save production-devops-app:${GITHUB_SHA} | gzip > image.tar.gz
+
+      - name: Upload scanned image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: scanned-image-${{ github.sha }}
+          path: image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   publish:
-    name: Push Image to Amazon ECR
+    name: Push Scanned Image to Amazon ECR
     needs: validate
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -61,8 +77,15 @@ jobs:
       AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Download scanned image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: scanned-image-${{ github.sha }}
+          path: image-artifact
+
+      - name: Load scanned image
+        run: |
+          gzip -dc image-artifact/image.tar.gz | docker load
 
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
@@ -71,14 +94,14 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
 
-      - name: Build and push immutable image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
-        with:
-          context: ./app
-          push: true
-          tags: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-          build-args: |
-            RELEASE_SHA=${{ github.sha }}
+      - name: Tag scanned image for ECR
+        run: |
+          ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker tag "production-devops-app:${GITHUB_SHA}" "$ECR_IMAGE"
+          echo "ECR_IMAGE=$ECR_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Push scanned image to ECR
+        run: |
+          docker push "$ECR_IMAGE"
