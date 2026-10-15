@@ -1,14 +1,18 @@
-name: CD - Deploy to EC2
+
+name: Blue-Green Continuous Deployment
 
 on:
+  workflow_run:
+    workflows: ["CI - Build and Scan Application"]
+    types:
+      - completed
+    branches:
+      - main
+
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Full 40-character Git commit SHA of the image to deploy"
-        required: true
-        type: string
-      instance_id:
-        description: "Current EC2 instance ID registered with SSM"
+        description: "Full 40-character Git commit SHA already published to ECR"
         required: true
         type: string
 
@@ -17,249 +21,283 @@ permissions:
   id-token: write
 
 concurrency:
-  group: production-deployment
+  group: production-blue-green-deployment
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy application to EC2
+    name: Deploy and promote healthy target
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
     runs-on: ubuntu-latest
-    environment: staging
+    timeout-minutes: 30
+
+    environment: production
 
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
 
+      ALB_ARN: ${{ vars.ALB_ARN }}
+
+      BLUE_TG_ARN: ${{ vars.BLUE_TG_ARN }}
+
+      GREEN_TG_ARN: ${{ vars.GREEN_TG_ARN }}
+
     steps:
-      - name: Validate deployment inputs
-        shell: bash
-        env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
-          INSTANCE_ID: ${{ inputs.instance_id }}
-        run: |
-          set -euo pipefail
-
-          if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Error: image_tag must be a full 40-character Git SHA."
-            exit 1
-          fi
-
-          if [[ ! "$INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]]; then
-            echo "Error: instance_id is not in the expected EC2 format."
-            exit 1
-          fi
-
-          echo "Image tag format is valid."
-          echo "Target instance format is valid."
-
-      - name: Configure AWS credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+      # --------------------------------------------------
+      # 1. Authenticate to AWS using GitHub OIDC
+      # --------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Verify image exists in ECR
-        id: image
+      # --------------------------------------------------
+      # 2. Determine which image to deploy
+      # --------------------------------------------------
+      - name: Resolve and validate image SHA
+        id: release
         shell: bash
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            IMAGE_TAG="$WORKFLOW_RUN_SHA"
+          else
+            IMAGE_TAG="$MANUAL_IMAGE_TAG"
+          fi
+
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full 40-character lowercase Git SHA." >&2
+            exit 1
+          fi
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Release image: $IMAGE_TAG"
+
+      # --------------------------------------------------
+      # 3. Verify that CI published the image to ECR
+      # --------------------------------------------------
+      - name: Verify image exists in ECR
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          set -Eeuo pipefail
 
           aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
-            --image-ids imageTag="$IMAGE_TAG" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --region "$AWS_REGION" >/dev/null
+
+          echo "Image verified in ECR."
+
+      # --------------------------------------------------
+      # 4. Identify active and inactive environments
+      # --------------------------------------------------
+      - name: Identify active and inactive environments
+        id: targets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$ALB_ARN" \
             --region "$AWS_REGION" \
-            >/dev/null
-
-          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "Confirmed image exists: $IMAGE_URI"
-
-      - name: Verify EC2 is online in Systems Manager
-        shell: bash
-        env:
-          INSTANCE_ID: ${{ inputs.instance_id }}
-        run: |
-          set -euo pipefail
-
-          STATE=$(aws ec2 describe-instances \
-            --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].State.Name' \
+            --query 'Listeners[?Port==`80`].ListenerArn | [0]' \
             --output text)
 
-          if [[ "$STATE" != "running" ]]; then
-            echo "Error: EC2 instance state is '$STATE', not 'running'."
+          if [[ -z "$LISTENER_ARN" || "$LISTENER_ARN" == "None" ]]; then
+            echo "Could not find the ALB listener on port 80." >&2
             exit 1
           fi
 
-          PING_STATUS=$(aws ssm describe-instance-information \
-            --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-            --query 'InstanceInformationList[0].PingStatus' \
-            --output text)
+          LISTENER_JSON=$(aws elbv2 describe-listeners \
+            --listener-arns "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
+            --output json)
 
-          if [[ "$PING_STATUS" != "Online" ]]; then
-            echo "Error: EC2 instance is not Online in Systems Manager."
+          ACTIVE_TG=$(jq -r '
+            .Listeners[0].DefaultActions[0]
+            | if .TargetGroupArn then .TargetGroupArn
+              else .ForwardConfig.TargetGroups[0].TargetGroupArn
+              end
+          ' <<< "$LISTENER_JSON")
+
+          if [[ "$ACTIVE_TG" == "$BLUE_TG_ARN" ]]; then
+            INACTIVE_TG="$GREEN_TG_ARN"
+          elif [[ "$ACTIVE_TG" == "$GREEN_TG_ARN" ]]; then
+            INACTIVE_TG="$BLUE_TG_ARN"
+          else
+            echo "Unrecognized active target group: $ACTIVE_TG" >&2
+            echo "Refusing to change production traffic." >&2
             exit 1
           fi
 
-          echo "EC2 is running and connected to SSM."
+          INSTANCE_ID=$(aws elbv2 describe-target-health \
+            --target-group-arn "$INACTIVE_TG" \
+            --region "$AWS_REGION" \
+            --query 'TargetHealthDescriptions[0].Target.Id' \
+            --output text)
 
-      - name: Deploy image through SSM
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+            echo "No EC2 instance registered in the inactive target group." >&2
+            exit 1
+          fi
+
+          echo "listener_arn=$LISTENER_ARN" >> "$GITHUB_OUTPUT"
+          echo "previous_tg=$ACTIVE_TG" >> "$GITHUB_OUTPUT"
+          echo "target_tg=$INACTIVE_TG" >> "$GITHUB_OUTPUT"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+          echo "Currently active: $ACTIVE_TG"
+          echo "Deployment target: $INACTIVE_TG"
+          echo "EC2 instance: $INSTANCE_ID"
+
+      # --------------------------------------------------
+      # 5. Deploy to the inactive EC2 instance using SSM
+      # --------------------------------------------------
+      - name: Deploy application through SSM
+        id: deploy
         shell: bash
         env:
-          IMAGE_URI: ${{ steps.image.outputs.uri }}
-          INSTANCE_ID: ${{ inputs.instance_id }}
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+          INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          read -r -d '' DEPLOY_SCRIPT <<'REMOTE_SCRIPT' || true
+          REMOTE_SCRIPT=$(cat <<'REMOTE'
           set -Eeuo pipefail
 
           IMAGE_URI="__IMAGE_URI__"
-          REGISTRY="__REGISTRY__"
           AWS_REGION="__AWS_REGION__"
+          AWS_ACCOUNT_ID="__AWS_ACCOUNT_ID__"
 
-          echo "Logging in to Amazon ECR..."
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$REGISTRY"
+          REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 
-          echo "Pulling requested image..."
+          # Authenticate and download the new release.
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+
           docker pull "$IMAGE_URI"
 
+          # Remember the previous image so we can recover if necessary.
           OLD_IMAGE=""
-          if docker inspect production-app >/dev/null 2>&1; then
+
+          if docker container inspect production-app >/dev/null 2>&1; then
             OLD_IMAGE=$(docker inspect \
-              --format='{{.Config.Image}}' production-app)
+              --format '{{.Config.Image}}' production-app)
+
+            docker stop production-app || true
+            docker rm production-app || true
           fi
 
-          echo "Starting temporary candidate container..."
-          docker rm -f production-app-candidate >/dev/null 2>&1 || true
+          rollback() {
+            docker rm -f production-app >/dev/null 2>&1 || true
 
-          docker run -d \
-            --name production-app-candidate \
-            -p 127.0.0.1:18081:80 \
-            "$IMAGE_URI"
+            if [[ -n "$OLD_IMAGE" ]]; then
+              echo "Restoring previous image: $OLD_IMAGE"
 
-          HEALTHY=false
-          for attempt in $(seq 1 10); do
-            if docker exec production-app-candidate \
-              wget -qO- http://127.0.0.1/ >/dev/null; then
-              HEALTHY=true
-              break
+              docker run -d \
+                --name production-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                "$OLD_IMAGE" || true
             fi
-            sleep 2
-          done
+          }
 
-          if [[ "$HEALTHY" != "true" ]]; then
-            echo "Candidate health check failed; keeping the current app."
-            docker rm -f production-app-candidate >/dev/null 2>&1 || true
-            exit 1
-          fi
-
-          docker rm -f production-app-candidate >/dev/null
-
-          echo "Replacing production container..."
-          docker rm -f production-app >/dev/null 2>&1 || true
-
+          # Start the new container.
           if ! docker run -d \
             --name production-app \
             --restart unless-stopped \
             -p 80:80 \
             "$IMAGE_URI"; then
-            echo "New container failed to start."
 
-            if [[ -n "$OLD_IMAGE" ]]; then
-              docker rm -f production-app >/dev/null 2>&1 || true
-              docker run -d \
-                --name production-app \
-                --restart unless-stopped \
-                -p 80:80 \
-                "$OLD_IMAGE"
-              echo "Previous image restarted."
-            fi
+            rollback
             exit 1
           fi
 
-          HEALTHY=false
-          for attempt in $(seq 1 10); do
-            if docker exec production-app \
-              wget -qO- http://127.0.0.1/ >/dev/null; then
-              HEALTHY=true
+          # Validate the app before allowing traffic to switch.
+          HEALTHY=0
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent \
+              --max-time 3 \
+              http://127.0.0.1/ >/dev/null; then
+
+              HEALTHY=1
               break
             fi
-            sleep 2
+
+            sleep 3
           done
 
-          if [[ "$HEALTHY" != "true" ]]; then
-            echo "Production health check failed."
-
-            docker rm -f production-app >/dev/null 2>&1 || true
-
-            if [[ -n "$OLD_IMAGE" ]]; then
-              docker run -d \
-                --name production-app \
-                --restart unless-stopped \
-                -p 80:80 \
-                "$OLD_IMAGE"
-              echo "Previous image restarted as rollback."
-            else
-              echo "No previous image was available for rollback."
-            fi
-
+          if [[ "$HEALTHY" -ne 1 ]]; then
+            echo "Local HTTP health check failed." >&2
+            docker logs --tail 100 production-app || true
+            rollback
             exit 1
           fi
 
-          echo "Deployment and container health check succeeded."
-          echo "Deployed image: $IMAGE_URI"
-          REMOTE_SCRIPT
+          echo "Local HTTP health check passed."
+          docker ps --filter name=production-app
+          REMOTE
+          )
 
-          # Pass values separately so they cannot be interpreted as shell syntax.
-          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__IMAGE_URI__/$IMAGE_URI}"
-          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__REGISTRY__/$REGISTRY}"
-          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__AWS_REGION__/$AWS_REGION}"
+          REMOTE_SCRIPT=${REMOTE_SCRIPT//__IMAGE_URI__/$IMAGE_URI}
+          REMOTE_SCRIPT=${REMOTE_SCRIPT//__AWS_REGION__/$AWS_REGION}
+          REMOTE_SCRIPT=${REMOTE_SCRIPT//__AWS_ACCOUNT_ID__/$AWS_ACCOUNT_ID}
 
-          PARAMETERS=$(jq -n --arg script "$DEPLOY_SCRIPT" \
+          PARAMETERS=$(jq -n \
+            --arg script "$REMOTE_SCRIPT" \
             '{commands: [$script]}')
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploy ${IMAGE_URI}" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 900 \
             --parameters "$PARAMETERS" \
+            --region "$AWS_REGION" \
             --query 'Command.CommandId' \
             --output text)
 
-          echo "SSM command submitted: $COMMAND_ID"
+          echo "SSM command: $COMMAND_ID"
 
-          for attempt in $(seq 1 60); do
+          STATUS="Pending"
+
+          for ATTEMPT in $(seq 1 180); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || echo "Pending")
+              --region "$AWS_REGION" \
+              --query Status \
+              --output text 2>/dev/null || true)
 
             case "$STATUS" in
               Success)
-                echo "SSM deployment completed successfully."
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$INSTANCE_ID" \
-                  --query 'StandardOutputContent' \
-                  --output text
-                exit 0
+                break
                 ;;
-              Failed|Cancelled|TimedOut)
-                echo "SSM deployment failed: $STATUS"
+              Failed|TimedOut|Cancelled)
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
-                  --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
-                  --output json
+                  --region "$AWS_REGION" \
+                  --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+                  --output json || true
+
+                echo "SSM deployment failed: $STATUS" >&2
                 exit 1
                 ;;
             esac
@@ -267,5 +305,96 @@ jobs:
             sleep 5
           done
 
-          echo "Timed out waiting for the SSM deployment command."
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "Timed out waiting for SSM. Status: $STATUS" >&2
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+            --output json
+
+      # --------------------------------------------------
+      # 6. Wait for ALB health checks to pass
+      # --------------------------------------------------
+      - name: Wait for inactive target to become healthy
+        shell: bash
+        env:
+          TARGET_TG: ${{ steps.targets.outputs.target_tg }}
+          INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          HEALTH="unknown"
+
+          for ATTEMPT in $(seq 1 48); do
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_TG" \
+              --targets "Id=$INSTANCE_ID,Port=80" \
+              --region "$AWS_REGION" \
+              --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+              --output text 2>/dev/null || true)
+
+            echo "ALB health: $HEALTH (attempt $ATTEMPT/48)"
+
+            if [[ "$HEALTH" == "healthy" ]]; then
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --targets "Id=$INSTANCE_ID,Port=80" \
+            --region "$AWS_REGION" \
+            --output json || true
+
+          echo "Target did not become healthy. Traffic was not switched." >&2
           exit 1
+
+      # --------------------------------------------------
+      # 7. Promote the new target and verify
+      # --------------------------------------------------
+      - name: Promote new target and verify
+        shell: bash
+        env:
+          LISTENER_ARN: ${{ steps.targets.outputs.listener_arn }}
+          PREVIOUS_TG: ${{ steps.targets.outputs.previous_tg }}
+          TARGET_TG: ${{ steps.targets.outputs.target_tg }}
+          INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          # The target must be healthy before this step is reached.
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions "Type=forward,TargetGroupArn=$TARGET_TG" \
+            --region "$AWS_REGION" >/dev/null
+
+          echo "Production listener updated."
+          sleep 10
+
+          HEALTH=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --targets "Id=$INSTANCE_ID,Port=80" \
+            --region "$AWS_REGION" \
+            --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+            --output text)
+
+          if [[ "$HEALTH" != "healthy" ]]; then
+            echo "New target is unhealthy; restoring previous listener." >&2
+
+            aws elbv2 modify-listener \
+              --listener-arn "$LISTENER_ARN" \
+              --default-actions "Type=forward,TargetGroupArn=$PREVIOUS_TG" \
+              --region "$AWS_REGION" >/dev/null
+
+            exit 1
+          fi
+
+          echo "Deployment successful."
+          echo "Production target group: $TARGET_TG"
