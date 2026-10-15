@@ -99,6 +99,34 @@ jobs:
           echo "Event: $GITHUB_EVENT_NAME"
           echo "Job environment: $GITHUB_ENVIRONMENT"
 
+      - name: Verify GitHub OIDC token issuance
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tokenUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+            const token = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+
+            if (!tokenUrl || !token) {
+              core.setFailed("GitHub OIDC token request variables are missing.");
+              return;
+            }
+
+            const response = await fetch(
+              `${tokenUrl}&audience=sts.amazonaws.com`,
+              {
+                headers: {
+                  Authorization: `Bearer ${token}`
+                }
+              }
+            );
+
+            if (!response.ok) {
+              core.setFailed(`OIDC token request failed with HTTP ${response.status}.`);
+              return;
+            }
+
+            core.info("GitHub OIDC token issued successfully.");
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
         with:
