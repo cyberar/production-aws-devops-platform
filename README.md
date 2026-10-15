@@ -6,7 +6,7 @@ Blue-Green deployment, monitoring, troubleshooting, and automated rollback.
 
 ## Architecture
 
-![Architecture Diagram](docs/architecture.png)
+![Architecture Diagram](docs/architecture.jpg)
 
 ## Project Goals
 

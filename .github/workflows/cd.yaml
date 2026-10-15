@@ -1,0 +1,271 @@
+name: CD - Deploy to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character Git commit SHA of the image to deploy"
+        required: true
+        type: string
+      instance_id:
+        description: "Current EC2 instance ID registered with SSM"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy application to EC2
+    runs-on: ubuntu-latest
+    environment: staging
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+    steps:
+      - name: Validate deployment inputs
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Error: image_tag must be a full 40-character Git SHA."
+            exit 1
+          fi
+
+          if [[ ! "$INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]]; then
+            echo "Error: instance_id is not in the expected EC2 format."
+            exit 1
+          fi
+
+          echo "Image tag format is valid."
+          echo "Target instance format is valid."
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify image exists in ECR
+        id: image
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            >/dev/null
+
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "Confirmed image exists: $IMAGE_URI"
+
+      - name: Verify EC2 is online in Systems Manager
+        shell: bash
+        env:
+          INSTANCE_ID: ${{ inputs.instance_id }}
+        run: |
+          set -euo pipefail
+
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)
+
+          if [[ "$STATE" != "running" ]]; then
+            echo "Error: EC2 instance state is '$STATE', not 'running'."
+            exit 1
+          fi
+
+          PING_STATUS=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query 'InstanceInformationList[0].PingStatus' \
+            --output text)
+
+          if [[ "$PING_STATUS" != "Online" ]]; then
+            echo "Error: EC2 instance is not Online in Systems Manager."
+            exit 1
+          fi
+
+          echo "EC2 is running and connected to SSM."
+
+      - name: Deploy image through SSM
+        shell: bash
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+        run: |
+          set -euo pipefail
+
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          read -r -d '' DEPLOY_SCRIPT <<'REMOTE_SCRIPT' || true
+          set -Eeuo pipefail
+
+          IMAGE_URI="__IMAGE_URI__"
+          REGISTRY="__REGISTRY__"
+          AWS_REGION="__AWS_REGION__"
+
+          echo "Logging in to Amazon ECR..."
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+          echo "Pulling requested image..."
+          docker pull "$IMAGE_URI"
+
+          OLD_IMAGE=""
+          if docker inspect production-app >/dev/null 2>&1; then
+            OLD_IMAGE=$(docker inspect \
+              --format='{{.Config.Image}}' production-app)
+          fi
+
+          echo "Starting temporary candidate container..."
+          docker rm -f production-app-candidate >/dev/null 2>&1 || true
+
+          docker run -d \
+            --name production-app-candidate \
+            -p 127.0.0.1:18081:80 \
+            "$IMAGE_URI"
+
+          HEALTHY=false
+          for attempt in $(seq 1 10); do
+            if docker exec production-app-candidate \
+              wget -qO- http://127.0.0.1/ >/dev/null; then
+              HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$HEALTHY" != "true" ]]; then
+            echo "Candidate health check failed; keeping the current app."
+            docker rm -f production-app-candidate >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          docker rm -f production-app-candidate >/dev/null
+
+          echo "Replacing production container..."
+          docker rm -f production-app >/dev/null 2>&1 || true
+
+          if ! docker run -d \
+            --name production-app \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$IMAGE_URI"; then
+            echo "New container failed to start."
+
+            if [[ -n "$OLD_IMAGE" ]]; then
+              docker rm -f production-app >/dev/null 2>&1 || true
+              docker run -d \
+                --name production-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                "$OLD_IMAGE"
+              echo "Previous image restarted."
+            fi
+            exit 1
+          fi
+
+          HEALTHY=false
+          for attempt in $(seq 1 10); do
+            if docker exec production-app \
+              wget -qO- http://127.0.0.1/ >/dev/null; then
+              HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$HEALTHY" != "true" ]]; then
+            echo "Production health check failed."
+
+            docker rm -f production-app >/dev/null 2>&1 || true
+
+            if [[ -n "$OLD_IMAGE" ]]; then
+              docker run -d \
+                --name production-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                "$OLD_IMAGE"
+              echo "Previous image restarted as rollback."
+            else
+              echo "No previous image was available for rollback."
+            fi
+
+            exit 1
+          fi
+
+          echo "Deployment and container health check succeeded."
+          echo "Deployed image: $IMAGE_URI"
+          REMOTE_SCRIPT
+
+          # Pass values separately so they cannot be interpreted as shell syntax.
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__IMAGE_URI__/$IMAGE_URI}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__REGISTRY__/$REGISTRY}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__AWS_REGION__/$AWS_REGION}"
+
+          PARAMETERS=$(jq -n --arg script "$DEPLOY_SCRIPT" \
+            '{commands: [$script]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${IMAGE_URI}" \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command submitted: $COMMAND_ID"
+
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            case "$STATUS" in
+              Success)
+                echo "SSM deployment completed successfully."
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "SSM deployment failed: $STATUS"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for the SSM deployment command."
+          exit 1
