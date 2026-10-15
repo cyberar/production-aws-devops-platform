@@ -1,5 +1,8 @@
 FROM nginx:alpine
 
+# Install dependencies and update packages
+RUN apk update && apk upgrade --no-cache
+
 ARG RELEASE_SHA=local
 
 COPY ./index.html /usr/share/nginx/html/index.html
