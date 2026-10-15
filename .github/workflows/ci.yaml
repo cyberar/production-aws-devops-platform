@@ -87,6 +87,18 @@ jobs:
         run: |
           gzip -dc image-artifact/image.tar.gz | docker load
 
+      - name: Inspect GitHub OIDC context
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_ENVIRONMENT: ${{ job.environment }}
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Job environment: $GITHUB_ENVIRONMENT"
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
         with:
