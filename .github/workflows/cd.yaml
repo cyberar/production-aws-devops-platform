@@ -356,6 +356,7 @@ jobs:
           echo "Target did not become healthy. Traffic was not switched." >&2
           exit 1
 
+      
       # --------------------------------------------------
       # 7. Promote the new target and verify
       # --------------------------------------------------
@@ -366,35 +367,103 @@ jobs:
           PREVIOUS_TG: ${{ steps.targets.outputs.previous_tg }}
           TARGET_TG: ${{ steps.targets.outputs.target_tg }}
           INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
+
         run: |
           set -Eeuo pipefail
 
-          # The target must be healthy before this step is reached.
-          aws elbv2 modify-listener \
-            --listener-arn "$LISTENER_ARN" \
-            --default-actions "Type=forward,TargetGroupArn=$TARGET_TG" \
-            --region "$AWS_REGION" >/dev/null
+          rollback() {
+            local exit_code=$?
+            trap - ERR
 
-          echo "Production listener updated."
-          sleep 10
+            echo "::error::Post-promotion failure. Attempting rollback to the previous target group."
 
-          HEALTH=$(aws elbv2 describe-target-health \
-            --target-group-arn "$TARGET_TG" \
-            --targets "Id=$INSTANCE_ID,Port=80" \
-            --region "$AWS_REGION" \
-            --query 'TargetHealthDescriptions[0].TargetHealth.State' \
-            --output text)
+            if ! aws elbv2 modify-listener \
+                --listener-arn "$LISTENER_ARN" \
+                --default-actions "Type=forward,TargetGroupArn=${PREVIOUS_TG}"; then
+              echo "::error::CRITICAL: Rollback API call failed. Restore the listener manually."
+              exit "$exit_code"
+            fi
 
-          if [[ "$HEALTH" != "healthy" ]]; then
-            echo "New target is unhealthy; restoring previous listener." >&2
+            # Verify that the listener's default action was restored.
+            local restored_tg=""
+            local attempt
 
-            aws elbv2 modify-listener \
-              --listener-arn "$LISTENER_ARN" \
-              --default-actions "Type=forward,TargetGroupArn=$PREVIOUS_TG" \
-              --region "$AWS_REGION" >/dev/null
+            for attempt in {1..6}; do
+              restored_tg=$(aws elbv2 describe-listeners \
+                --listener-arns "$LISTENER_ARN" \
+                --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+                --output text) || restored_tg=""
 
+              if [[ "$restored_tg" == "$PREVIOUS_TG" ]]; then
+                echo "Rollback verified: listener points to the previous target group."
+                exit "$exit_code"
+              fi
+
+              sleep 5
+            done
+
+            echo "::error::CRITICAL: Could not verify rollback. Check the ALB listener in AWS."
+            exit "$exit_code"
+          }
+
+          # Validate required values before changing production traffic.
+          for variable in LISTENER_ARN PREVIOUS_TG TARGET_TG; do
+            if [[ -z "${!variable}" || "${!variable}" == "None" ]]; then
+              echo "::error::Missing required value: ${variable}"
+              exit 1
+            fi
+          done
+
+          if [[ "$PREVIOUS_TG" == "$TARGET_TG" ]]; then
+            echo "::error::Previous and target groups must be different."
             exit 1
           fi
+
+          # Confirm the new target still has at least one healthy target.
+          HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text)
+
+          if [[ "$HEALTHY_COUNT" -lt 1 ]]; then
+            echo "::error::Target group has no healthy targets. Promotion cancelled."
+            exit 1
+          fi
+
+          # Promote the new target group.
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions "Type=forward,TargetGroupArn=${TARGET_TG}"
+
+          # Arm rollback immediately after successful promotion.
+          trap rollback ERR
+
+          sleep 10
+
+          # Verify that production traffic now points to the new target group.
+          CURRENT_TG=$(aws elbv2 describe-listeners \
+            --listener-arns "$LISTENER_ARN" \
+            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+            --output text)
+
+          if [[ "$CURRENT_TG" != "$TARGET_TG" ]]; then
+            echo "::error::Listener is not forwarding to the new target group."
+            false
+          fi
+
+          # Verify that the new target remains healthy after promotion.
+          HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text)
+
+          if [[ "$HEALTHY_COUNT" -lt 1 ]]; then
+            echo "::error::No healthy targets remain after promotion."
+            false
+          fi
+
+          # Disable rollback only after all checks pass.
+          trap - ERR
 
           echo "Deployment successful."
           echo "Production target group: $TARGET_TG"
