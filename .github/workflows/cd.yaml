@@ -36,18 +36,14 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     environment: production
 
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-
       ALB_ARN: ${{ vars.ALB_ARN }}
-
       BLUE_TG_ARN: ${{ vars.BLUE_TG_ARN }}
-
       GREEN_TG_ARN: ${{ vars.GREEN_TG_ARN }}
 
     steps:
@@ -166,6 +162,7 @@ jobs:
 
       # --------------------------------------------------
       # 5. Deploy to the inactive EC2 instance using SSM
+      #    Persist the previous image for later rollback.
       # --------------------------------------------------
       - name: Deploy application through SSM
         id: deploy
@@ -186,6 +183,7 @@ jobs:
           AWS_ACCOUNT_ID="__AWS_ACCOUNT_ID__"
 
           REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          PREVIOUS_IMAGE_FILE="/var/lib/production-app/previous-image"
 
           # Authenticate and download the new release.
           aws ecr get-login-password --region "$AWS_REGION" |
@@ -193,50 +191,78 @@ jobs:
 
           docker pull "$IMAGE_URI"
 
-          # Remember the previous image so we can recover if necessary.
+          # Save the old image before stopping the existing container.
           OLD_IMAGE=""
 
           if docker container inspect production-app >/dev/null 2>&1; then
             OLD_IMAGE=$(docker inspect \
               --format '{{.Config.Image}}' production-app)
 
+            if [[ -z "$OLD_IMAGE" ]]; then
+              echo "Could not determine the previous container image." >&2
+              exit 1
+            fi
+
+            mkdir -p /var/lib/production-app
+            printf '%s\n' "$OLD_IMAGE" > "$PREVIOUS_IMAGE_FILE"
+
+            # Ensure the old image remains available locally.
+            docker image inspect "$OLD_IMAGE" >/dev/null
+
             docker stop production-app || true
             docker rm production-app || true
+          else
+            echo "No previous production-app container exists."
+            rm -f "$PREVIOUS_IMAGE_FILE"
           fi
 
-          rollback() {
-            docker rm -f production-app >/dev/null 2>&1 || true
+          rollback_local() {
+            local exit_code=$?
+            trap - ERR
+            set +e
+
+            echo "Attempting local rollback to: ${OLD_IMAGE:-none}"
+
+            docker rm -f production-app >/dev/null 2>&1
 
             if [[ -n "$OLD_IMAGE" ]]; then
-              echo "Restoring previous image: $OLD_IMAGE"
-
               docker run -d \
                 --name production-app \
                 --restart unless-stopped \
                 -p 80:80 \
-                "$OLD_IMAGE" || true
+                "$OLD_IMAGE"
+
+              local run_status=$?
+
+              if [[ "$run_status" -ne 0 ]]; then
+                echo "CRITICAL: Failed to restart the previous image."
+              fi
+            else
+              echo "No previous image was available for local rollback."
             fi
+
+            exit "$exit_code"
           }
 
-          # Start the new container.
+          # Roll back if a command fails after replacement begins.
+          trap rollback_local ERR
+
           if ! docker run -d \
             --name production-app \
             --restart unless-stopped \
             -p 80:80 \
             "$IMAGE_URI"; then
-
-            rollback
-            exit 1
+            echo "Failed to start the new container." >&2
+            rollback_local
           fi
 
-          # Validate the app before allowing traffic to switch.
+          # Check local application health.
           HEALTHY=0
 
           for attempt in $(seq 1 20); do
             if curl --fail --silent \
               --max-time 3 \
               http://127.0.0.1/ >/dev/null; then
-
               HEALTHY=1
               break
             fi
@@ -247,9 +273,11 @@ jobs:
           if [[ "$HEALTHY" -ne 1 ]]; then
             echo "Local HTTP health check failed." >&2
             docker logs --tail 100 production-app || true
-            rollback
-            exit 1
+            rollback_local
           fi
+
+          # Keep the previous image reference until ALB health passes.
+          trap - ERR
 
           echo "Local HTTP health check passed."
           docker ps --filter name=production-app
@@ -289,7 +317,7 @@ jobs:
               Success)
                 break
                 ;;
-              Failed|TimedOut|Cancelled)
+              Failed|TimedOut|Cancelled|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
@@ -318,7 +346,8 @@ jobs:
             --output json
 
       # --------------------------------------------------
-      # 6. Wait for ALB health checks to pass
+      # 6. Wait for ALB health; restore the old image
+      #    through SSM if the target never becomes healthy.
       # --------------------------------------------------
       - name: Wait for inactive target to become healthy
         shell: bash
@@ -341,11 +370,14 @@ jobs:
             echo "ALB health: $HEALTH (attempt $ATTEMPT/48)"
 
             if [[ "$HEALTH" == "healthy" ]]; then
+              echo "Inactive target is healthy. Ready for promotion."
               exit 0
             fi
 
             sleep 5
           done
+
+          echo "::error::Inactive target did not become healthy. Starting application rollback."
 
           aws elbv2 describe-target-health \
             --target-group-arn "$TARGET_TG" \
@@ -353,12 +385,121 @@ jobs:
             --region "$AWS_REGION" \
             --output json || true
 
-          echo "Target did not become healthy. Traffic was not switched." >&2
+          # Restore the saved image on the inactive EC2 instance.
+          ROLLBACK_SCRIPT=$(cat <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          PREVIOUS_IMAGE_FILE="/var/lib/production-app/previous-image"
+
+          if [[ ! -s "$PREVIOUS_IMAGE_FILE" ]]; then
+            echo "CRITICAL: No saved previous image is available."
+
+            # There is no known-good image to restore.
+            docker rm -f production-app >/dev/null 2>&1 || true
+
+            echo "Manual recovery is required for this instance."
+            exit 1
+          fi
+
+          PREVIOUS_IMAGE=$(cat "$PREVIOUS_IMAGE_FILE")
+
+          if ! docker image inspect "$PREVIOUS_IMAGE" >/dev/null 2>&1; then
+            echo "CRITICAL: Previous image is missing locally: $PREVIOUS_IMAGE"
+            exit 1
+          fi
+
+          echo "Restoring previous image: $PREVIOUS_IMAGE"
+
+          docker rm -f production-app >/dev/null 2>&1 || true
+
+          docker run -d \
+            --name production-app \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$PREVIOUS_IMAGE"
+
+          # Verify the restored application locally.
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --max-time 3 \
+                http://127.0.0.1/ >/dev/null; then
+              echo "Previous image restored and local HTTP check passed."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "CRITICAL: Previous image failed its local HTTP check."
+          docker logs --tail 100 production-app || true
+          exit 1
+          REMOTE_SCRIPT
+          )
+
+          PARAMETERS=$(jq -n \
+            --arg script "$ROLLBACK_SCRIPT" \
+            '{commands: ["bash -lc " + ($script | @sh)]}')
+
+          ROLLBACK_COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 600 \
+            --parameters "$PARAMETERS" \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "Rollback SSM command: $ROLLBACK_COMMAND_ID"
+
+          ROLLBACK_STATUS="Pending"
+
+          for ATTEMPT in $(seq 1 120); do
+            ROLLBACK_STATUS=$(aws ssm get-command-invocation \
+              --command-id "$ROLLBACK_COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query Status \
+              --output text 2>/dev/null || true)
+
+            echo "Rollback status: $ROLLBACK_STATUS (attempt $ATTEMPT/120)"
+
+            case "$ROLLBACK_STATUS" in
+              Success)
+                break
+                ;;
+              Failed|TimedOut|Cancelled|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "$ROLLBACK_COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+                  --output json || true
+
+                echo "::error::CRITICAL: Application rollback failed."
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          if [[ "$ROLLBACK_STATUS" != "Success" ]]; then
+            echo "::error::CRITICAL: Timed out waiting for application rollback."
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$ROLLBACK_COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+            --output json
+
+          echo "Previous image restored. Production traffic was not switched."
           exit 1
 
-      
       # --------------------------------------------------
-      # 7. Promote the new target and verify
+      # 7. Promote the new target and verify.
+      #    Restore the previous target if promotion fails.
       # --------------------------------------------------
       - name: Promote new target and verify
         shell: bash
@@ -367,32 +508,62 @@ jobs:
           PREVIOUS_TG: ${{ steps.targets.outputs.previous_tg }}
           TARGET_TG: ${{ steps.targets.outputs.target_tg }}
           INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
-
         run: |
           set -Eeuo pipefail
+
+          PROMOTION_ATTEMPTED=false
 
           rollback() {
             local exit_code=$?
             trap - ERR
+            set +e
 
-            echo "::error::Post-promotion failure. Attempting rollback to the previous target group."
+            if [[ "$PROMOTION_ATTEMPTED" != "true" ]]; then
+              exit "$exit_code"
+            fi
+
+            echo "::error::Failure during or after promotion. Checking listener state."
+
+            local current_tg=""
+            current_tg=$(aws elbv2 describe-listeners \
+              --listener-arns "$LISTENER_ARN" \
+              --region "$AWS_REGION" \
+              --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+              --output text 2>/dev/null)
+
+            local describe_status=$?
+
+            if [[ "$describe_status" -ne 0 ||
+                  -z "$current_tg" ||
+                  "$current_tg" == "None" ]]; then
+              echo "::error::CRITICAL: Could not determine listener state. Check AWS manually."
+              exit "$exit_code"
+            fi
+
+            if [[ "$current_tg" == "$PREVIOUS_TG" ]]; then
+              echo "Listener already points to the previous target group."
+              exit "$exit_code"
+            fi
+
+            echo "Restoring previous target group: $PREVIOUS_TG"
 
             if ! aws elbv2 modify-listener \
                 --listener-arn "$LISTENER_ARN" \
+                --region "$AWS_REGION" \
                 --default-actions "Type=forward,TargetGroupArn=${PREVIOUS_TG}"; then
               echo "::error::CRITICAL: Rollback API call failed. Restore the listener manually."
               exit "$exit_code"
             fi
 
-            # Verify that the listener's default action was restored.
             local restored_tg=""
             local attempt
 
             for attempt in {1..6}; do
               restored_tg=$(aws elbv2 describe-listeners \
                 --listener-arns "$LISTENER_ARN" \
+                --region "$AWS_REGION" \
                 --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
-                --output text) || restored_tg=""
+                --output text 2>/dev/null)
 
               if [[ "$restored_tg" == "$PREVIOUS_TG" ]]; then
                 echo "Rollback verified: listener points to the previous target group."
@@ -419,9 +590,10 @@ jobs:
             exit 1
           fi
 
-          # Confirm the new target still has at least one healthy target.
+          # Verify the new target is healthy immediately before promotion.
           HEALTHY_COUNT=$(aws elbv2 describe-target-health \
             --target-group-arn "$TARGET_TG" \
+            --region "$AWS_REGION" \
             --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
             --output text)
 
@@ -430,19 +602,23 @@ jobs:
             exit 1
           fi
 
-          # Promote the new target group.
+          # Arm rollback BEFORE attempting the listener modification.
+          # This covers ambiguous failures where AWS may have applied the
+          # change even if the CLI reports an error.
+          PROMOTION_ATTEMPTED=true
+          trap rollback ERR
+
           aws elbv2 modify-listener \
             --listener-arn "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
             --default-actions "Type=forward,TargetGroupArn=${TARGET_TG}"
-
-          # Arm rollback immediately after successful promotion.
-          trap rollback ERR
 
           sleep 10
 
-          # Verify that production traffic now points to the new target group.
+          # Verify that production now points to the new target group.
           CURRENT_TG=$(aws elbv2 describe-listeners \
             --listener-arns "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
             --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
             --output text)
 
@@ -451,9 +627,10 @@ jobs:
             false
           fi
 
-          # Verify that the new target remains healthy after promotion.
+          # Verify the new target still has a healthy registered target.
           HEALTHY_COUNT=$(aws elbv2 describe-target-health \
             --target-group-arn "$TARGET_TG" \
+            --region "$AWS_REGION" \
             --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
             --output text)
 
