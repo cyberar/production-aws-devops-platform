@@ -1,0 +1,646 @@
+
+name: Blue-Green Continuous Deployment
+
+on:
+  workflow_run:
+    workflows: ["CI - Build and Scan Application"]
+    types:
+      - completed
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character Git commit SHA already published to ECR"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-blue-green-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy and promote healthy target
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ALB_ARN: ${{ vars.ALB_ARN }}
+      BLUE_TG_ARN: ${{ vars.BLUE_TG_ARN }}
+      GREEN_TG_ARN: ${{ vars.GREEN_TG_ARN }}
+
+    steps:
+      # --------------------------------------------------
+      # 1. Authenticate to AWS using GitHub OIDC
+      # --------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 2. Determine which image to deploy
+      # --------------------------------------------------
+      - name: Resolve and validate image SHA
+        id: release
+        shell: bash
+        env:
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            IMAGE_TAG="$WORKFLOW_RUN_SHA"
+          else
+            IMAGE_TAG="$MANUAL_IMAGE_TAG"
+          fi
+
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full 40-character lowercase Git SHA." >&2
+            exit 1
+          fi
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Release image: $IMAGE_TAG"
+
+      # --------------------------------------------------
+      # 3. Verify that CI published the image to ECR
+      # --------------------------------------------------
+      - name: Verify image exists in ECR
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --region "$AWS_REGION" >/dev/null
+
+          echo "Image verified in ECR."
+
+      # --------------------------------------------------
+      # 4. Identify active and inactive environments
+      # --------------------------------------------------
+      - name: Identify active and inactive environments
+        id: targets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$ALB_ARN" \
+            --region "$AWS_REGION" \
+            --query 'Listeners[?Port==`80`].ListenerArn | [0]' \
+            --output text)
+
+          if [[ -z "$LISTENER_ARN" || "$LISTENER_ARN" == "None" ]]; then
+            echo "Could not find the ALB listener on port 80." >&2
+            exit 1
+          fi
+
+          LISTENER_JSON=$(aws elbv2 describe-listeners \
+            --listener-arns "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
+            --output json)
+
+          ACTIVE_TG=$(jq -r '
+            .Listeners[0].DefaultActions[0]
+            | if .TargetGroupArn then .TargetGroupArn
+              else .ForwardConfig.TargetGroups[0].TargetGroupArn
+              end
+          ' <<< "$LISTENER_JSON")
+
+          if [[ "$ACTIVE_TG" == "$BLUE_TG_ARN" ]]; then
+            INACTIVE_TG="$GREEN_TG_ARN"
+          elif [[ "$ACTIVE_TG" == "$GREEN_TG_ARN" ]]; then
+            INACTIVE_TG="$BLUE_TG_ARN"
+          else
+            echo "Unrecognized active target group: $ACTIVE_TG" >&2
+            echo "Refusing to change production traffic." >&2
+            exit 1
+          fi
+
+          INSTANCE_ID=$(aws elbv2 describe-target-health \
+            --target-group-arn "$INACTIVE_TG" \
+            --region "$AWS_REGION" \
+            --query 'TargetHealthDescriptions[0].Target.Id' \
+            --output text)
+
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+            echo "No EC2 instance registered in the inactive target group." >&2
+            exit 1
+          fi
+
+          echo "listener_arn=$LISTENER_ARN" >> "$GITHUB_OUTPUT"
+          echo "previous_tg=$ACTIVE_TG" >> "$GITHUB_OUTPUT"
+          echo "target_tg=$INACTIVE_TG" >> "$GITHUB_OUTPUT"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+          echo "Currently active: $ACTIVE_TG"
+          echo "Deployment target: $INACTIVE_TG"
+          echo "EC2 instance: $INSTANCE_ID"
+
+      # --------------------------------------------------
+      # 5. Deploy to the inactive EC2 instance using SSM
+      #    Persist the previous image for later rollback.
+      # --------------------------------------------------
+      - name: Deploy application through SSM
+        id: deploy
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+          INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          REMOTE_SCRIPT=$(cat <<'REMOTE'
+          set -Eeuo pipefail
+
+          IMAGE_URI="__IMAGE_URI__"
+          AWS_REGION="__AWS_REGION__"
+          AWS_ACCOUNT_ID="__AWS_ACCOUNT_ID__"
+
+          REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          PREVIOUS_IMAGE_FILE="/var/lib/production-app/previous-image"
+
+          # Authenticate and download the new release.
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+
+          docker pull "$IMAGE_URI"
+
+          # Save the old image before stopping the existing container.
+          OLD_IMAGE=""
+
+          if docker container inspect production-app >/dev/null 2>&1; then
+            OLD_IMAGE=$(docker inspect \
+              --format '{{.Config.Image}}' production-app)
+
+            if [[ -z "$OLD_IMAGE" ]]; then
+              echo "Could not determine the previous container image." >&2
+              exit 1
+            fi
+
+            mkdir -p /var/lib/production-app
+            printf '%s\n' "$OLD_IMAGE" > "$PREVIOUS_IMAGE_FILE"
+
+            # Ensure the old image remains available locally.
+            docker image inspect "$OLD_IMAGE" >/dev/null
+
+            docker stop production-app || true
+            docker rm production-app || true
+          else
+            echo "No previous production-app container exists."
+            rm -f "$PREVIOUS_IMAGE_FILE"
+          fi
+
+          rollback_local() {
+            local exit_code=$?
+            trap - ERR
+            set +e
+
+            echo "Attempting local rollback to: ${OLD_IMAGE:-none}"
+
+            docker rm -f production-app >/dev/null 2>&1
+
+            if [[ -n "$OLD_IMAGE" ]]; then
+              docker run -d \
+                --name production-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                "$OLD_IMAGE"
+
+              local run_status=$?
+
+              if [[ "$run_status" -ne 0 ]]; then
+                echo "CRITICAL: Failed to restart the previous image."
+              fi
+            else
+              echo "No previous image was available for local rollback."
+            fi
+
+            exit "$exit_code"
+          }
+
+          # Roll back if a command fails after replacement begins.
+          trap rollback_local ERR
+
+          if ! docker run -d \
+            --name production-app \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$IMAGE_URI"; then
+            echo "Failed to start the new container." >&2
+            rollback_local
+          fi
+
+          # Check local application health.
+          HEALTHY=0
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent \
+              --max-time 3 \
+              http://127.0.0.1/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+
+            sleep 3
+          done
+
+          if [[ "$HEALTHY" -ne 1 ]]; then
+            echo "Local HTTP health check failed." >&2
+            docker logs --tail 100 production-app || true
+            rollback_local
+          fi
+
+          # Keep the previous image reference until ALB health passes.
+          trap - ERR
+
+          echo "Local HTTP health check passed."
+          docker ps --filter name=production-app
+          REMOTE
+          )
+
+          REMOTE_SCRIPT=${REMOTE_SCRIPT//__IMAGE_URI__/$IMAGE_URI}
+          REMOTE_SCRIPT=${REMOTE_SCRIPT//__AWS_REGION__/$AWS_REGION}
+          REMOTE_SCRIPT=${REMOTE_SCRIPT//__AWS_ACCOUNT_ID__/$AWS_ACCOUNT_ID}
+
+          PARAMETERS=$(jq -n \
+            --arg script "$REMOTE_SCRIPT" \
+            '{commands: [$script]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 900 \
+            --parameters "$PARAMETERS" \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command: $COMMAND_ID"
+
+          STATUS="Pending"
+
+          for ATTEMPT in $(seq 1 180); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query Status \
+              --output text 2>/dev/null || true)
+
+            case "$STATUS" in
+              Success)
+                break
+                ;;
+              Failed|TimedOut|Cancelled|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+                  --output json || true
+
+                echo "SSM deployment failed: $STATUS" >&2
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "Timed out waiting for SSM. Status: $STATUS" >&2
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+            --output json
+
+      # --------------------------------------------------
+      # 6. Wait for ALB health; restore the old image
+      #    through SSM if the target never becomes healthy.
+      # --------------------------------------------------
+      - name: Wait for inactive target to become healthy
+        shell: bash
+        env:
+          TARGET_TG: ${{ steps.targets.outputs.target_tg }}
+          INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          HEALTH="unknown"
+
+          for ATTEMPT in $(seq 1 48); do
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_TG" \
+              --targets "Id=$INSTANCE_ID,Port=80" \
+              --region "$AWS_REGION" \
+              --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+              --output text 2>/dev/null || true)
+
+            echo "ALB health: $HEALTH (attempt $ATTEMPT/48)"
+
+            if [[ "$HEALTH" == "healthy" ]]; then
+              echo "Inactive target is healthy. Ready for promotion."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "::error::Inactive target did not become healthy. Starting application rollback."
+
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --targets "Id=$INSTANCE_ID,Port=80" \
+            --region "$AWS_REGION" \
+            --output json || true
+
+          # Restore the saved image on the inactive EC2 instance.
+          ROLLBACK_SCRIPT=$(cat <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          PREVIOUS_IMAGE_FILE="/var/lib/production-app/previous-image"
+
+          if [[ ! -s "$PREVIOUS_IMAGE_FILE" ]]; then
+            echo "CRITICAL: No saved previous image is available."
+
+            # There is no known-good image to restore.
+            docker rm -f production-app >/dev/null 2>&1 || true
+
+            echo "Manual recovery is required for this instance."
+            exit 1
+          fi
+
+          PREVIOUS_IMAGE=$(cat "$PREVIOUS_IMAGE_FILE")
+
+          if ! docker image inspect "$PREVIOUS_IMAGE" >/dev/null 2>&1; then
+            echo "CRITICAL: Previous image is missing locally: $PREVIOUS_IMAGE"
+            exit 1
+          fi
+
+          echo "Restoring previous image: $PREVIOUS_IMAGE"
+
+          docker rm -f production-app >/dev/null 2>&1 || true
+
+          docker run -d \
+            --name production-app \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$PREVIOUS_IMAGE"
+
+          # Verify the restored application locally.
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --max-time 3 \
+                http://127.0.0.1/ >/dev/null; then
+              echo "Previous image restored and local HTTP check passed."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "CRITICAL: Previous image failed its local HTTP check."
+          docker logs --tail 100 production-app || true
+          exit 1
+          REMOTE_SCRIPT
+          )
+
+          PARAMETERS=$(jq -n \
+            --arg script "$ROLLBACK_SCRIPT" \
+            '{commands: ["bash -lc " + ($script | @sh)]}')
+
+          ROLLBACK_COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 600 \
+            --parameters "$PARAMETERS" \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "Rollback SSM command: $ROLLBACK_COMMAND_ID"
+
+          ROLLBACK_STATUS="Pending"
+
+          for ATTEMPT in $(seq 1 120); do
+            ROLLBACK_STATUS=$(aws ssm get-command-invocation \
+              --command-id "$ROLLBACK_COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query Status \
+              --output text 2>/dev/null || true)
+
+            echo "Rollback status: $ROLLBACK_STATUS (attempt $ATTEMPT/120)"
+
+            case "$ROLLBACK_STATUS" in
+              Success)
+                break
+                ;;
+              Failed|TimedOut|Cancelled|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "$ROLLBACK_COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+                  --output json || true
+
+                echo "::error::CRITICAL: Application rollback failed."
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          if [[ "$ROLLBACK_STATUS" != "Success" ]]; then
+            echo "::error::CRITICAL: Timed out waiting for application rollback."
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$ROLLBACK_COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+            --output json
+
+          echo "Previous image restored. Production traffic was not switched."
+          exit 1
+
+      # --------------------------------------------------
+      # 7. Promote the new target and verify.
+      #    Restore the previous target if promotion fails.
+      # --------------------------------------------------
+      - name: Promote new target and verify
+        shell: bash
+        env:
+          LISTENER_ARN: ${{ steps.targets.outputs.listener_arn }}
+          PREVIOUS_TG: ${{ steps.targets.outputs.previous_tg }}
+          TARGET_TG: ${{ steps.targets.outputs.target_tg }}
+          INSTANCE_ID: ${{ steps.targets.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          PROMOTION_ATTEMPTED=false
+
+          rollback() {
+            local exit_code=$?
+            trap - ERR
+            set +e
+
+            if [[ "$PROMOTION_ATTEMPTED" != "true" ]]; then
+              exit "$exit_code"
+            fi
+
+            echo "::error::Failure during or after promotion. Checking listener state."
+
+            local current_tg=""
+            current_tg=$(aws elbv2 describe-listeners \
+              --listener-arns "$LISTENER_ARN" \
+              --region "$AWS_REGION" \
+              --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+              --output text 2>/dev/null)
+
+            local describe_status=$?
+
+            if [[ "$describe_status" -ne 0 ||
+                  -z "$current_tg" ||
+                  "$current_tg" == "None" ]]; then
+              echo "::error::CRITICAL: Could not determine listener state. Check AWS manually."
+              exit "$exit_code"
+            fi
+
+            if [[ "$current_tg" == "$PREVIOUS_TG" ]]; then
+              echo "Listener already points to the previous target group."
+              exit "$exit_code"
+            fi
+
+            echo "Restoring previous target group: $PREVIOUS_TG"
+
+            if ! aws elbv2 modify-listener \
+                --listener-arn "$LISTENER_ARN" \
+                --region "$AWS_REGION" \
+                --default-actions "Type=forward,TargetGroupArn=${PREVIOUS_TG}"; then
+              echo "::error::CRITICAL: Rollback API call failed. Restore the listener manually."
+              exit "$exit_code"
+            fi
+
+            local restored_tg=""
+            local attempt
+
+            for attempt in {1..6}; do
+              restored_tg=$(aws elbv2 describe-listeners \
+                --listener-arns "$LISTENER_ARN" \
+                --region "$AWS_REGION" \
+                --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+                --output text 2>/dev/null)
+
+              if [[ "$restored_tg" == "$PREVIOUS_TG" ]]; then
+                echo "Rollback verified: listener points to the previous target group."
+                exit "$exit_code"
+              fi
+
+              sleep 5
+            done
+
+            echo "::error::CRITICAL: Could not verify rollback. Check the ALB listener in AWS."
+            exit "$exit_code"
+          }
+
+          # Validate required values before changing production traffic.
+          for variable in LISTENER_ARN PREVIOUS_TG TARGET_TG; do
+            if [[ -z "${!variable}" || "${!variable}" == "None" ]]; then
+              echo "::error::Missing required value: ${variable}"
+              exit 1
+            fi
+          done
+
+          if [[ "$PREVIOUS_TG" == "$TARGET_TG" ]]; then
+            echo "::error::Previous and target groups must be different."
+            exit 1
+          fi
+
+          # Verify the new target is healthy immediately before promotion.
+          HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --region "$AWS_REGION" \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text)
+
+          if [[ "$HEALTHY_COUNT" -lt 1 ]]; then
+            echo "::error::Target group has no healthy targets. Promotion cancelled."
+            exit 1
+          fi
+
+          # Arm rollback BEFORE attempting the listener modification.
+          # This covers ambiguous failures where AWS may have applied the
+          # change even if the CLI reports an error.
+          PROMOTION_ATTEMPTED=true
+          trap rollback ERR
+
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
+            --default-actions "Type=forward,TargetGroupArn=${TARGET_TG}"
+
+          sleep 10
+
+          # Verify that production now points to the new target group.
+          CURRENT_TG=$(aws elbv2 describe-listeners \
+            --listener-arns "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
+            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+            --output text)
+
+          if [[ "$CURRENT_TG" != "$TARGET_TG" ]]; then
+            echo "::error::Listener is not forwarding to the new target group."
+            false
+          fi
+
+          # Verify the new target still has a healthy registered target.
+          HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_TG" \
+            --region "$AWS_REGION" \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text)
+
+          if [[ "$HEALTHY_COUNT" -lt 1 ]]; then
+            echo "::error::No healthy targets remain after promotion."
+            false
+          fi
+
+          # Disable rollback only after all checks pass.
+          trap - ERR
+
+          echo "Deployment successful."
+          echo "Production target group: $TARGET_TG"
