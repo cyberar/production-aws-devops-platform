@@ -265,6 +265,7 @@ jobs:
                 --restart unless-stopped \
                 --read-only \
                 --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+                --tmpfs /run:rw,noexec,nosuid,size=16m,uid=101,gid=101,mode=0755 \
                 --tmpfs /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0755 \
                 --cap-drop ALL \
                 --security-opt no-new-privileges:true \
@@ -293,6 +294,7 @@ jobs:
             --restart unless-stopped \
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+            --tmpfs /run:rw,noexec,nosuid,size=16m,uid=101,gid=101,mode=0755 \
             --tmpfs /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0755 \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
@@ -466,6 +468,7 @@ jobs:
             --restart unless-stopped \
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+            --tmpfs /run:rw,noexec,nosuid,size=16m,uid=101,gid=101,mode=0755 \
             --tmpfs /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0755 \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \

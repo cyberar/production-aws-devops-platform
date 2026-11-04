@@ -8,9 +8,10 @@ RUN sed -i \
     -e 's/listen 80;/listen 8080;/' \
     -e 's/listen \[::\]:80;/listen [::]:8080;/' \
     /etc/nginx/conf.d/default.conf \
-    && sed -i \
-    -e 's|pid /var/run/nginx.pid;|pid /tmp/nginx.pid;|' \
+    && sed -i -E \
+    's|^[[:space:]]*pid[[:space:]]+[^;]+;|pid /tmp/nginx.pid;|' \
     /etc/nginx/nginx.conf \
+    && grep -q 'pid /tmp/nginx.pid;' /etc/nginx/nginx.conf \
     && chown -R nginx:nginx /var/cache/nginx
 
 # Application release metadata.
