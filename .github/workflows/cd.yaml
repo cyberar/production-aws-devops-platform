@@ -176,6 +176,7 @@ jobs:
           IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
 
           REMOTE_SCRIPT=$(cat <<'REMOTE'
+          bash <<'BASH_SCRIPT'
           set -Eeuo pipefail
 
           IMAGE_URI="__IMAGE_URI__"
@@ -217,7 +218,9 @@ jobs:
           fi
 
           rollback_local() {
-            local exit_code=$?
+            local exit_code="${1:-1}"
+
+            # Prevent the ERR trap from triggering recursively.
             trap - ERR
             set +e
 
@@ -235,17 +238,19 @@ jobs:
               local run_status=$?
 
               if [[ "$run_status" -ne 0 ]]; then
-                echo "CRITICAL: Failed to restart the previous image."
+                echo "CRITICAL: Failed to restart the previous image." >&2
+              else
+                echo "Previous image restarted: $OLD_IMAGE"
               fi
             else
-              echo "No previous image was available for local rollback."
+              echo "No previous image was available for local rollback." >&2
             fi
 
             exit "$exit_code"
           }
 
           # Roll back if a command fails after replacement begins.
-          trap rollback_local ERR
+          trap 'rollback_local "$?"' ERR
 
           if ! docker run -d \
             --name production-app \
@@ -253,7 +258,7 @@ jobs:
             -p 80:80 \
             "$IMAGE_URI"; then
             echo "Failed to start the new container." >&2
-            rollback_local
+            rollback_local 1
           fi
 
           # Check local application health.
@@ -281,6 +286,7 @@ jobs:
 
           echo "Local HTTP health check passed."
           docker ps --filter name=production-app
+          BASH_SCRIPT
           REMOTE
           )
 
