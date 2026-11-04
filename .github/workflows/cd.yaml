@@ -264,11 +264,12 @@ jobs:
                 --name production-app \
                 --restart unless-stopped \
                 --read-only \
-                --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+                --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+                --tmpfs /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0755 \
                 --cap-drop ALL \
                 --security-opt no-new-privileges:true \
                 -p 80:8080 \
-                "$OLD_IMAGE"
+                "$IMAGE_URI"
 
               local run_status=$?
 
@@ -291,7 +292,8 @@ jobs:
             --name production-app \
             --restart unless-stopped \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+            --tmpfs /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0755 \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             -p 80:8080 \
@@ -463,7 +465,8 @@ jobs:
             --name production-app \
             --restart unless-stopped \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+            --tmpfs /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0755 \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             -p 80:8080 \
