@@ -125,8 +125,12 @@ jobs:
 
           ACTIVE_TG=$(jq -r '
             .Listeners[0].DefaultActions[0]
-            | if .TargetGroupArn then .TargetGroupArn
-              else .ForwardConfig.TargetGroups[0].TargetGroupArn
+            | if .TargetGroupArn then
+                .TargetGroupArn
+              else
+                .ForwardConfig.TargetGroups
+                | max_by(.Weight)
+                | .TargetGroupArn
               end
           ' <<< "$LISTENER_JSON")
 
@@ -140,6 +144,33 @@ jobs:
             exit 1
           fi
 
+          # Associate both target groups with the ALB listener.
+          # The active environment keeps 100% of production traffic.
+          # The inactive environment receives 0% until promotion.
+
+          DEFAULT_ACTIONS=$(jq -cn \
+            --arg active "$ACTIVE_TG" \
+            --arg inactive "$INACTIVE_TG" \
+            '[{
+              Type: "forward",
+              ForwardConfig: {
+                TargetGroups: [
+                  {TargetGroupArn: $active, Weight: 100},
+                  {TargetGroupArn: $inactive, Weight: 0}
+                ]
+              }
+            }]')
+
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --region "$AWS_REGION" \
+            --default-actions "$DEFAULT_ACTIONS"
+
+          echo "Both target groups are now associated with the ALB."
+          echo "Production traffic remains on: $ACTIVE_TG"
+          echo "Inactive target receives 0% of production traffic."
+
+          # Retrieve the EC2 instance registered in the inactive target group.
           INSTANCE_ID=$(aws elbv2 describe-target-health \
             --target-group-arn "$INACTIVE_TG" \
             --region "$AWS_REGION" \
@@ -232,7 +263,11 @@ jobs:
               docker run -d \
                 --name production-app \
                 --restart unless-stopped \
-                -p 80:80 \
+                --read-only \
+                --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+                --cap-drop ALL \
+                --security-opt no-new-privileges:true \
+                -p 80:8080 \
                 "$OLD_IMAGE"
 
               local run_status=$?
@@ -255,7 +290,11 @@ jobs:
           if ! docker run -d \
             --name production-app \
             --restart unless-stopped \
-            -p 80:80 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -p 80:8080 \
             "$IMAGE_URI"; then
             echo "Failed to start the new container." >&2
             rollback_local 1
@@ -397,14 +436,16 @@ jobs:
 
           PREVIOUS_IMAGE_FILE="/var/lib/production-app/previous-image"
 
+          # First deployment to this instance: there is no old image to restore.
           if [[ ! -s "$PREVIOUS_IMAGE_FILE" ]]; then
-            echo "CRITICAL: No saved previous image is available."
+            echo "No saved previous image exists. This is the first deployment to this instance."
 
-            # There is no known-good image to restore.
             docker rm -f production-app >/dev/null 2>&1 || true
 
-            echo "Manual recovery is required for this instance."
-            exit 1
+            echo "No previous application version was available to restore."
+            echo "The inactive instance has been left without the failed container."
+            echo "Production traffic remains on the previous healthy target."
+            exit 0
           fi
 
           PREVIOUS_IMAGE=$(cat "$PREVIOUS_IMAGE_FILE")
@@ -421,7 +462,11 @@ jobs:
           docker run -d \
             --name production-app \
             --restart unless-stopped \
-            -p 80:80 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -p 80:8080 \
             "$PREVIOUS_IMAGE"
 
           # Verify the restored application locally.
@@ -480,7 +525,7 @@ jobs:
                   --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
                   --output json || true
 
-                echo "::error::CRITICAL: Application rollback failed."
+                echo "::error::CRITICAL: Application recovery failed."
                 exit 1
                 ;;
             esac
@@ -489,7 +534,7 @@ jobs:
           done
 
           if [[ "$ROLLBACK_STATUS" != "Success" ]]; then
-            echo "::error::CRITICAL: Timed out waiting for application rollback."
+            echo "::error::CRITICAL: Timed out waiting for application recovery."
             exit 1
           fi
 
@@ -500,7 +545,10 @@ jobs:
             --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
             --output json
 
-          echo "Previous image restored. Production traffic was not switched."
+          echo "Inactive target recovery completed."
+          echo "Production traffic was not switched."
+
+          # Keep the deployment marked as failed.
           exit 1
 
       # --------------------------------------------------
@@ -521,6 +569,7 @@ jobs:
 
           rollback() {
             local exit_code=$?
+
             trap - ERR
             set +e
 
@@ -531,17 +580,21 @@ jobs:
             echo "::error::Failure during or after promotion. Checking listener state."
 
             local current_tg=""
-            current_tg=$(aws elbv2 describe-listeners \
-              --listener-arns "$LISTENER_ARN" \
-              --region "$AWS_REGION" \
-              --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
-              --output text 2>/dev/null)
 
-            local describe_status=$?
-
-            if [[ "$describe_status" -ne 0 ||
-                  -z "$current_tg" ||
-                  "$current_tg" == "None" ]]; then
+            if ! current_tg=$(aws elbv2 describe-listeners \
+                --listener-arns "$LISTENER_ARN" \
+                --region "$AWS_REGION" \
+                --output json |
+                jq -r '
+                  .Listeners[0].DefaultActions[0]
+                  | if .TargetGroupArn then
+                      .TargetGroupArn
+                    else
+                      .ForwardConfig.TargetGroups
+                      | max_by(.Weight)
+                      | .TargetGroupArn
+                    end
+                '); then
               echo "::error::CRITICAL: Could not determine listener state. Check AWS manually."
               exit "$exit_code"
             fi
@@ -553,10 +606,25 @@ jobs:
 
             echo "Restoring previous target group: $PREVIOUS_TG"
 
+            local rollback_actions
+
+            rollback_actions=$(jq -cn \
+              --arg previous "$PREVIOUS_TG" \
+              --arg failed "$TARGET_TG" \
+              '[{
+                Type: "forward",
+                ForwardConfig: {
+                  TargetGroups: [
+                    {TargetGroupArn: $previous, Weight: 100},
+                    {TargetGroupArn: $failed, Weight: 0}
+                  ]
+                }
+              }]')
+
             if ! aws elbv2 modify-listener \
                 --listener-arn "$LISTENER_ARN" \
                 --region "$AWS_REGION" \
-                --default-actions "Type=forward,TargetGroupArn=${PREVIOUS_TG}"; then
+                --default-actions "$rollback_actions"; then
               echo "::error::CRITICAL: Rollback API call failed. Restore the listener manually."
               exit "$exit_code"
             fi
@@ -565,15 +633,25 @@ jobs:
             local attempt
 
             for attempt in {1..6}; do
-              restored_tg=$(aws elbv2 describe-listeners \
-                --listener-arns "$LISTENER_ARN" \
-                --region "$AWS_REGION" \
-                --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
-                --output text 2>/dev/null)
+              if restored_tg=$(aws elbv2 describe-listeners \
+                  --listener-arns "$LISTENER_ARN" \
+                  --region "$AWS_REGION" \
+                  --output json |
+                  jq -r '
+                    .Listeners[0].DefaultActions[0]
+                    | if .TargetGroupArn then
+                        .TargetGroupArn
+                      else
+                        .ForwardConfig.TargetGroups
+                        | max_by(.Weight)
+                        | .TargetGroupArn
+                      end
+                  '); then
 
-              if [[ "$restored_tg" == "$PREVIOUS_TG" ]]; then
-                echo "Rollback verified: listener points to the previous target group."
-                exit "$exit_code"
+                if [[ "$restored_tg" == "$PREVIOUS_TG" ]]; then
+                  echo "Rollback verified: listener points to the previous target group."
+                  exit "$exit_code"
+                fi
               fi
 
               sleep 5
@@ -608,16 +686,29 @@ jobs:
             exit 1
           fi
 
-          # Arm rollback BEFORE attempting the listener modification.
-          # This covers ambiguous failures where AWS may have applied the
-          # change even if the CLI reports an error.
+          # Prepare weighted forwarding:
+          # New target receives 100%; previous target receives 0%.
+          PROMOTION_ACTIONS=$(jq -cn \
+            --arg new "$TARGET_TG" \
+            --arg previous "$PREVIOUS_TG" \
+            '[{
+              Type: "forward",
+              ForwardConfig: {
+                TargetGroups: [
+                  {TargetGroupArn: $new, Weight: 100},
+                  {TargetGroupArn: $previous, Weight: 0}
+                ]
+              }
+            }]')
+
+          # Arm rollback before attempting the listener modification.
           PROMOTION_ATTEMPTED=true
           trap rollback ERR
 
           aws elbv2 modify-listener \
             --listener-arn "$LISTENER_ARN" \
             --region "$AWS_REGION" \
-            --default-actions "Type=forward,TargetGroupArn=${TARGET_TG}"
+            --default-actions "$PROMOTION_ACTIONS"
 
           sleep 10
 
@@ -625,8 +716,17 @@ jobs:
           CURRENT_TG=$(aws elbv2 describe-listeners \
             --listener-arns "$LISTENER_ARN" \
             --region "$AWS_REGION" \
-            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
-            --output text)
+            --output json |
+            jq -r '
+              .Listeners[0].DefaultActions[0]
+              | if .TargetGroupArn then
+                  .TargetGroupArn
+                else
+                  .ForwardConfig.TargetGroups
+                  | max_by(.Weight)
+                  | .TargetGroupArn
+                end
+            ')
 
           if [[ "$CURRENT_TG" != "$TARGET_TG" ]]; then
             echo "::error::Listener is not forwarding to the new target group."
