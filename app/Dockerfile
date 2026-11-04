@@ -7,6 +7,7 @@ ARG RELEASE_SHA=local
 
 COPY ./index.html /usr/share/nginx/html/index.html
 
+# Update 
 RUN sed -i "s/RELEASE_PLACEHOLDER/${RELEASE_SHA}/g" \
     /usr/share/nginx/html/index.html
 
