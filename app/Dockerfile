@@ -4,13 +4,15 @@ FROM nginx:alpine
 RUN apk upgrade --no-cache
 
 # Configure Nginx to listen on port 8080.
-RUN sed -i \
-    -e 's/listen 80;/listen 8080;/' \
-    -e 's/listen \[::\]:80;/listen [::]:8080;/' \
+# Configure a writable PID file and cache directory.
+RUN sed -i -E \
+    -e 's/^[[:space:]]*listen[[:space:]]+80;/    listen 8080;/' \
+    -e 's/^[[:space:]]*listen[[:space:]]+\[::\]:80;/    listen [::]:8080;/' \
     /etc/nginx/conf.d/default.conf \
     && sed -i -E \
     's|^[[:space:]]*pid[[:space:]]+[^;]+;|pid /tmp/nginx.pid;|' \
     /etc/nginx/nginx.conf \
+    && grep -qE '^[[:space:]]*listen[[:space:]]+8080;' /etc/nginx/conf.d/default.conf \
     && grep -q 'pid /tmp/nginx.pid;' /etc/nginx/nginx.conf \
     && chown -R nginx:nginx /var/cache/nginx
 
