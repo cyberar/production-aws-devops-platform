@@ -1,0 +1,92 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Healthy Hosts - Blue vs Green",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 60,
+        "metrics": [
+          ["AWS/ApplicationELB", "HealthyHostCount", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", "TargetGroup", "targetgroup/production-blue-tg/e9a1e9378f70dea6", {"stat": "Average", "label": "Blue"}],
+          ["AWS/ApplicationELB", "HealthyHostCount", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", "TargetGroup", "targetgroup/production-green-tg/eed521a1e9d32921", {"stat": "Average", "label": "Green"}]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Unhealthy Hosts - Blue vs Green",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 60,
+        "metrics": [
+          ["AWS/ApplicationELB", "UnHealthyHostCount", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", "TargetGroup", "targetgroup/production-blue-tg/e9a1e9378f70dea6", {"stat": "Maximum", "label": "Blue"}],
+          ["AWS/ApplicationELB", "UnHealthyHostCount", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", "TargetGroup", "targetgroup/production-green-tg/eed521a1e9d32921", {"stat": "Maximum", "label": "Green"}]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "EC2 CPU Utilization",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 300,
+        "metrics": [
+          ["AWS/EC2", "CPUUtilization", "InstanceId", "i-029bb15ed361595d3", {"stat": "Average", "label": "Blue EC2"}],
+          ["AWS/EC2", "CPUUtilization", "InstanceId", "i-03f37b2467c7ad1f6", {"stat": "Average", "label": "Green EC2"}]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "ALB Request Count",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 60,
+        "metrics": [
+          ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", {"stat": "Sum"}]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "ALB Target Response Time",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 60,
+        "metrics": [
+          ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", {"stat": "Average"}]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "ALB and Application HTTP 5xx Errors",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 60,
+        "metrics": [
+          ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", {"stat": "Sum", "label": "ALB 5xx"}],
+          ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "app/production-devops-alb/20622c548e44b789", {"stat": "Sum", "label": "Application 5xx"}]
+        ]
+      }
+    }
+  ]
+}

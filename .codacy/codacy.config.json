@@ -7,10 +7,11 @@
     "repositoryId": null,
     "repositoryName": null,
     "createdAt": "2026-10-15T14:47:59.633Z",
-    "updatedAt": "2026-10-15T14:47:59.633Z",
+    "updatedAt": "2026-11-05T19:22:37.390Z",
     "languages": [
       "Dockerfile",
       "HTML",
+      "JSON",
       "Markdown",
       "Terraform",
       "YAML"
@@ -497,6 +498,15 @@
         },
         {
           "patternId": "Semgrep_yaml_spring_rule-SpringActuatorFullyEnabled"
+        },
+        {
+          "patternId": "Semgrep_json.aws.security.public-s3-bucket.public-s3-bucket"
+        },
+        {
+          "patternId": "Semgrep_json.aws.security.public-s3-policy-statement.public-s3-policy-statement"
+        },
+        {
+          "patternId": "Semgrep_json.aws.security.wildcard-assume-role.wildcard-assume-role"
         }
       ]
     },
@@ -4326,9 +4336,106 @@
         },
         {
           "patternId": "Checkov_CKV_YC_9"
+        },
+        {
+          "patternId": "Checkov_CKV_AZURE_243"
+        },
+        {
+          "patternId": "Checkov_CKV_BITBUCKET_1"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_1"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_10"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_11"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_12"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_13"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_14"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_15"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_16"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_17"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_18"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_19"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_2"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_20"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_21"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_22"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_23"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_26"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_27"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_28"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_3"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_4"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_5"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_6"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_7"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_8"
+        },
+        {
+          "patternId": "Checkov_CKV_GITHUB_9"
+        },
+        {
+          "patternId": "Checkov_CKV_GITLAB_1"
+        }
+      ]
+    },
+    {
+      "toolId": "jackson",
+      "patterns": [
+        {
+          "patternId": "jackson_duplicate-keys"
+        },
+        {
+          "patternId": "jackson_parse-error"
         }
       ]
     }
-  ],
-  "exclude": []
+  ]
 }
