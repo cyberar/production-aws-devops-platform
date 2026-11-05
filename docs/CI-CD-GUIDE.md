@@ -64,6 +64,32 @@ arn:aws:iam::292659698191:role/production-github-actions-role
 This ARN belongs to the documented AWS account. Replace it when reproducing the project in another account.
 
 The IAM trust policy should restrict which GitHub repository, branch, and/or environment can assume the role. The role permissions policy should be limited to the actions required by CI/CD. Confirm the actual policy documents rather than assuming the role is least-privilege.
+Go to AWS IAM roles and click on the roles for gitactions from the roles created. Edit the `trust boundary` to follow the git actions correct
+repository format. For this project, I used the following trust boundary:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+      {
+          "Effect": "Allow",
+          "Principal": {
+              "Federated": "arn:aws:iam::292659698191:oidc-provider/token.actions.githubusercontent.com"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+              "StringEquals": {
+                  "token.actions.githubusercontent.com:sub": [
+                      "repo:cyberar@<repo_ID>/production-aws-devops-platform@1352984228:ref:refs/heads/main",
+                      "repo:cyberar@<repo_ID>/production-aws-devops-platform@1352984228:environment:Staging"
+                  ],
+                  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              }
+          }
+      }
+  ]
+}
+```
 
 ## 7. GitHub Environments and variables
 
